@@ -1,0 +1,161 @@
+version: '3.8'
+
+services:
+  # TimescaleDB for time-series data
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: vehicle_monitoring_db
+    environment:
+      POSTGRES_DB: vehicle_monitoring
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secure_password_123
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - monitoring_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d vehicle_monitoring"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and message queuing
+  redis:
+    image: redis:7-alpine
+    container_name: vehicle_monitoring_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - monitoring_network
+    command: redis-server --appendonly yes --requirepass redis_password_123
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Main application
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: vehicle_monitoring_app
+    environment:
+      POSTGRES_HOST: timescaledb
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: vehicle_monitoring
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secure_password_123
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: redis_password_123
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8000:8000"  # API
+      - "8501:8501"  # Dashboard
+    volumes:
+      - ..:/app
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - monitoring_network
+    command: >
+      sh -c "python main.py & streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0"
+    restart: unless-stopped
+
+  # API service (separate container for scaling)
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: vehicle_monitoring_api
+    environment:
+      POSTGRES_HOST: timescaledb
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: vehicle_monitoring
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secure_password_123
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: redis_password_123
+    ports:
+      - "8001:8000"
+    depends_on:
+      - timescaledb
+      - redis
+    networks:
+      - monitoring_network
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --workers 4
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: vehicle_monitoring_prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring_network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+  # Grafana for advanced visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: vehicle_monitoring_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana_dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - monitoring_network
+    depends_on:
+      - prometheus
+
+  # MQTT Broker for IoT data
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: vehicle_monitoring_mqtt
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    networks:
+      - monitoring_network
+    restart: unless-stopped
+
+volumes:
+  timescaledb_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  mosquitto_data:
+  mosquitto_log:
+
+networks:
+  monitoring_network:
+    driver: bridge
